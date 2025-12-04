@@ -410,9 +410,22 @@ def run_dense_reconstruction(output_dir: str, num_images: int = 30,
         if enable_cleaning:
             segmentation = clean_segmentation(segmentation, image_np)
         
-        # Estimate scale from sparse points
-        scale = estimate_depth_scale(depth, K, R, t, sparse_points, cam_width, cam_height)
+        # Scale intrinsics if image resolution differs from camera model
+        depth_H, depth_W = depth.shape[:2]
+        if depth_W != cam_width or depth_H != cam_height:
+            scale_x = depth_W / cam_width
+            scale_y = depth_H / cam_height
+            K_img = K.copy()
+            K_img[0, 0] *= scale_x  # fx
+            K_img[1, 1] *= scale_y  # fy
+            K_img[0, 2] *= scale_x  # cx
+            K_img[1, 2] *= scale_y  # cy
+        else:
+            K_img = K
         
+        # Estimate scale from sparse points
+        scale = estimate_depth_scale(depth, K_img, R, t, sparse_points, depth_W, depth_H)
+
         # Save depth visualization
         depth_vis = ((depth - depth.min()) / (depth.max() - depth.min() + 1e-8) * 255).astype(np.uint8)
         cv2.imwrite(str(depth_dir / f"{stem}_depth.png"), cv2.applyColorMap(depth_vis, cv2.COLORMAP_INFERNO))
@@ -428,9 +441,9 @@ def run_dense_reconstruction(output_dir: str, num_images: int = 30,
                 global_label_counts[name] = {"id": info["id"], "count": 0}
             global_label_counts[name]["count"] += info["count"]
         
-        # Reproject to 3D
+        # Reproject to 3D (use scaled intrinsics)
         points, colors, labels = depth_to_pointcloud(
-            depth, image_np, K, R, t, scale=scale,
+            depth, image_np, K_img, R, t, scale=scale,
             downsample=downsample, max_depth=max_depth,
             segmentation=segmentation
         )
@@ -497,6 +510,106 @@ def run_dense_reconstruction(output_dir: str, num_images: int = 30,
     print(f"  - {seg_dir}/                      (segmentation visualizations)")
 
 
+def run_colmap_pipeline(input_dir: str, output_dir: str) -> SfMResult:
+    """
+    Fallback: Run full COLMAP pipeline using pycolmap's native SIFT extraction and matching.
+    Used when DISK-based SfM fails.
+    """
+    import shutil
+    
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    db_path = output_dir / "database.db"
+    image_path = output_dir / "images"
+    sparse_path = output_dir / "sparse" / "0"
+    
+    image_path.mkdir(parents=True, exist_ok=True)
+    sparse_path.mkdir(parents=True, exist_ok=True)
+    
+    # Remove old database
+    if db_path.exists():
+        db_path.unlink()
+    
+    # Copy images to output folder
+    print("  Copying images...")
+    input_path = Path(input_dir)
+    for img_file in input_path.glob("*"):
+        if img_file.suffix.lower() in ['.jpg', '.jpeg', '.png']:
+            shutil.copy(img_file, image_path)
+    
+    # Feature extraction (pycolmap's SIFT)
+    print("  Extracting features (COLMAP SIFT)...")
+    pycolmap.extract_features(
+        database_path=str(db_path),
+        image_path=str(image_path),
+    )
+    
+    # Exhaustive matching
+    print("  Matching features...")
+    pycolmap.match_exhaustive(database_path=str(db_path))
+    
+    # Incremental SfM
+    print("  Running incremental SfM...")
+    reconstructions = pycolmap.incremental_mapping(
+        database_path=str(db_path),
+        image_path=str(image_path),
+        output_path=str(sparse_path.parent),
+    )
+    
+    if not reconstructions:
+        raise RuntimeError("COLMAP SfM failed - no reconstruction produced")
+    
+    # Get best reconstruction
+    best_idx = max(reconstructions.keys(), key=lambda k: reconstructions[k].num_reg_images())
+    recon = reconstructions[best_idx]
+    
+    print(f"  Reconstruction complete: {recon.num_reg_images()} images registered")
+    print(f"  3D points: {len(recon.points3D)}")
+    
+    # Save COLMAP binary files
+    recon.write_binary(str(sparse_path))
+    
+    # Export PLY
+    try:
+        recon.export_PLY(str(sparse_path / "points.ply"))
+    except:
+        pass
+    
+    # Extract result
+    cameras = {}
+    for img_id in recon.reg_image_ids():
+        image = recon.images[img_id]
+        cam = recon.cameras[image.camera_id]
+        pose = image.cam_from_world()
+        
+        # Parse frame index from filename
+        name = image.name
+        import re
+        nums = re.findall(r'\d+', name)
+        frame_idx = int(nums[0]) if nums else img_id
+        
+        cameras[frame_idx] = Camera(
+            R=pose.rotation.matrix(),
+            t=np.array(pose.translation),
+            K=cam.calibration_matrix(),
+            image_id=img_id
+        )
+    
+    points3d = np.array([pt.xyz for pt in recon.points3D.values()]) if recon.points3D else np.zeros((0, 3))
+    colors = np.array([pt.color for pt in recon.points3D.values()]) if recon.points3D else np.zeros((0, 3), dtype=np.uint8)
+    errors = np.array([pt.error for pt in recon.points3D.values()]) if recon.points3D else np.zeros(0)
+    
+    return SfMResult(
+        cameras=cameras,
+        points3d=points3d,
+        colors=colors,
+        point_errors=errors,
+        num_registered=recon.num_reg_images(),
+        num_total=len(list(image_path.glob("*")))
+    )
+
+
 if __name__ == '__main__':
     import argparse
     
@@ -549,6 +662,7 @@ if __name__ == '__main__':
         h, w = frames[0].image.shape[:2]
         sfm = SfMReconstructor(image_size=(w, h))
         
+        sfm_success = False
         try:
             with timeit("SfM reconstruction") as t:
                 result = sfm.reconstruct(frames, features, matches, output_dir=output_dir)
@@ -558,7 +672,35 @@ if __name__ == '__main__':
             print(f"  Registered images: {result.num_registered}/{result.num_total}")
             print(f"  3D points: {len(result.points3d)}")
             print(f"  Mean reprojection error: {result.point_errors.mean():.3f} px" if len(result.point_errors) > 0 else "  No points")
+            sfm_success = True
             
+        except Exception as e:
+            print(f"\nDISK-based SfM failed: {e}")
+            print("\n" + "="*60)
+            print("Falling back to vanilla COLMAP pipeline...")
+            print("="*60)
+            
+            try:
+                with timeit("COLMAP fallback") as t:
+                    result = run_colmap_pipeline(args.input, output_dir)
+                timings['4_colmap_fallback'] = t.elapsed
+                
+                print(f"\nCOLMAP Results:")
+                print(f"  Registered images: {result.num_registered}/{result.num_total}")
+                print(f"  3D points: {len(result.points3d)}")
+                print(f"  Mean reprojection error: {result.point_errors.mean():.3f} px" if len(result.point_errors) > 0 else "  No points")
+                
+                # Reload frames from COLMAP output for consistency
+                loader = VideoLoader(subsample=1, blur_threshold=0, max_size=None)
+                frames = loader.load_images(f"{output_dir}/images")
+                sfm_success = True
+                
+            except Exception as e2:
+                print(f"\nCOLMAP fallback also failed: {e2}")
+                import traceback
+                traceback.print_exc()
+        
+        if sfm_success:
             print("\n" + "="*60)
             print("Saving SfM outputs...")
             print("="*60)
@@ -572,11 +714,7 @@ if __name__ == '__main__':
             with timeit("Filter registered") as t:
                 registered_frames = save_registered_images(result, frames, output_dir)
             timings['6_filter'] = t.elapsed
-            
-        except Exception as e:
-            print(f"\nSfM failed: {e}")
-            import traceback
-            traceback.print_exc()
+        else:
             args.skip_dense = True  # Can't run dense without SfM
     
     # Run dense reconstruction
