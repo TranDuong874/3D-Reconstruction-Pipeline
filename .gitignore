@@ -1,3 +1,4 @@
 /output
 .venv/
 data/*
+segment-anything-2/
